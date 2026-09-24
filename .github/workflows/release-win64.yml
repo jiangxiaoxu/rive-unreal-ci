@@ -1,0 +1,342 @@
+name: Release Rive Unreal Win64 source plugin
+
+# Only published, non-prerelease upstream releases are considered.
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Published upstream release tag (empty means latest stable release)'
+        required: false
+        type: string
+
+concurrency:
+  group: rive-unreal-win64-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      build: ${{ steps.refs.outputs.build }}
+      upstream_tag: ${{ steps.refs.outputs.upstream_tag }}
+      release_tag: ${{ steps.refs.outputs.release_tag }}
+      plugin_sha: ${{ steps.refs.outputs.plugin_sha }}
+      runtime_sha: ${{ steps.refs.outputs.runtime_sha }}
+      ci_sha: ${{ steps.refs.outputs.ci_sha }}
+    steps:
+      - name: Resolve immutable release inputs
+        id: refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != 'jiangxiaoxu/rive-unreal-ci' ]]; then
+            echo 'This workflow only publishes from jiangxiaoxu/rive-unreal-ci.' >&2
+            exit 1
+          fi
+
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            upstream_tag=$REQUESTED_TAG
+          else
+            upstream_tag=$(gh api repos/rive-app/rive-unreal/releases/latest --jq '.tag_name')
+          fi
+          if [[ ! "$upstream_tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "Unsupported upstream tag: $upstream_tag" >&2
+            exit 1
+          fi
+          upstream_release=$(gh api "repos/rive-app/rive-unreal/releases/tags/${upstream_tag}")
+          if ! jq -e --arg tag "$upstream_tag" '(.tag_name == $tag) and (.draft == false) and (.prerelease == false) and (.published_at != null)' <<< "$upstream_release" >/dev/null; then
+            echo "Tag $upstream_tag is not a published stable upstream release." >&2
+            exit 1
+          fi
+          release_tag="win64-$upstream_tag"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+          # Release tags belong to this CI repository. They do not identify upstream plugin commits.
+          tag_ref_status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/release-tag-ref.json" --write-out '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}")
+          case "$tag_ref_status" in
+            200) tag_ref=$(cat "$RUNNER_TEMP/release-tag-ref.json") ;;
+            404) tag_ref='' ;;
+            *) echo "Cannot inspect CI tag $release_tag (HTTP $tag_ref_status)." >&2; exit 1 ;;
+          esac
+          if [[ -n "$tag_ref" ]]; then
+            object_type=$(jq -r '.object.type' <<< "$tag_ref")
+            tag_ci_sha=$(jq -r '.object.sha' <<< "$tag_ref")
+            if [[ "$object_type" == tag && "$tag_ci_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_ci_sha}")
+              object_type=$(jq -r '.object.type' <<< "$tag_object")
+              tag_ci_sha=$(jq -r '.object.sha' <<< "$tag_object")
+            fi
+            if [[ "$object_type" != commit || ! "$tag_ci_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "CI tag $release_tag does not resolve to a commit." >&2
+              exit 1
+            fi
+          fi
+
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            api_url=$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq '.apiUrl')
+            existing=$(gh api "$api_url")
+            if jq -e --arg name 'RiveUnreal-Win64.zip' \
+              '[.assets[] | select(.name == $name and .state == "uploaded" and (.size // 0) > 0)] | length > 0' \
+              <<< "$existing" >/dev/null; then
+              if [[ "$(jq -r '.draft' <<< "$existing")" == true ]]; then
+                echo 'Finalizing draft that already contains the zip.'
+                echo 'build=finalize' >> "$GITHUB_OUTPUT"
+              else
+                echo 'Release zip already exists; no build needed.'
+                echo 'build=false' >> "$GITHUB_OUTPUT"
+              fi
+              exit 0
+            fi
+
+            # A failed release creation may leave a draft without its zip. Its body
+            # records the exact upstream and CI commits so retries cannot drift.
+            body=$(jq -r '.body // ""' <<< "$existing")
+            marker=$(sed -n 's/^<!-- rive-ci-refs: \(.*\) -->$/\1/p' <<< "$body" | head -n 1)
+            if [[ -z "$marker" ]] || ! jq -e . <<< "$marker" >/dev/null; then
+              echo "Release $release_tag lacks valid pinned commit metadata." >&2
+              exit 1
+            fi
+            plugin_sha=$(jq -r '.pluginSha // empty' <<< "$marker")
+            runtime_sha=$(jq -r '.runtimeSha // empty' <<< "$marker")
+            ci_sha=$(jq -r '.ciSha // empty' <<< "$marker")
+            recorded_tag=$(jq -r '.upstreamTag // empty' <<< "$marker")
+            if [[ ! "$plugin_sha" =~ ^[0-9a-f]{40}$ || ! "$runtime_sha" =~ ^[0-9a-f]{40}$ || ! "$ci_sha" =~ ^[0-9a-f]{40}$ || "$recorded_tag" != "$upstream_tag" ]]; then
+              echo "Release $release_tag contains invalid pinned commit metadata." >&2
+              exit 1
+            fi
+            if [[ -n "$tag_ref" ]]; then
+              if [[ "$tag_ci_sha" != "$ci_sha" ]]; then
+                echo "CI tag $release_tag does not match the recorded CI commit." >&2
+                exit 1
+              fi
+            else
+              target=$(jq -r '.target_commitish // empty' <<< "$existing")
+              if [[ "$target" != "$ci_sha" ]]; then
+                echo "Draft release without a tag has no matching pinned CI target commit." >&2
+                exit 1
+              fi
+            fi
+            gh api "repos/rive-app/rive-unreal/commits/${plugin_sha}" --jq '.sha' | grep -Fxq "$plugin_sha"
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${ci_sha}" --jq '.sha' | grep -Fxq "$ci_sha"
+          else
+            if [[ -n "$tag_ref" ]]; then
+              echo "CI tag $release_tag exists without a release. Upstream commits cannot be recovered; refusing to rebuild." >&2
+              exit 1
+            fi
+            plugin_sha=$(gh api repos/rive-app/rive-unreal/branches/main --jq '.commit.sha')
+            ci_sha=$GITHUB_SHA
+            runtime_sha=''
+            if [[ ! "$plugin_sha" =~ ^[0-9a-f]{40}$ || ! "$ci_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo 'Could not resolve upstream main and CI commits.' >&2
+              exit 1
+            fi
+          fi
+          echo "plugin_sha=$plugin_sha" >> "$GITHUB_OUTPUT"
+          echo "runtime_sha=$runtime_sha" >> "$GITHUB_OUTPUT"
+          echo "ci_sha=$ci_sha" >> "$GITHUB_OUTPUT"
+          echo 'build=true' >> "$GITHUB_OUTPUT"
+
+  build-runtime-win64:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      runtime_sha: ${{ steps.runtime.outputs.runtime_sha }}
+    env:
+      PLUGIN_SHA: ${{ needs.resolve.outputs.plugin_sha }}
+      EXPECTED_RUNTIME_SHA: ${{ needs.resolve.outputs.runtime_sha }}
+    steps:
+      - name: Check out CI tools at pinned commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ci_sha }}
+          path: ci
+          persist-credentials: false
+
+      - name: Check out upstream plugin and runtime gitlink
+        uses: actions/checkout@v4
+        with:
+          repository: rive-app/rive-unreal
+          ref: ${{ env.PLUGIN_SHA }}
+          path: plugin
+          submodules: recursive
+          lfs: false
+          persist-credentials: false
+
+      - name: Verify runtime gitlink and locate MSVC
+        id: runtime
+        shell: pwsh
+        run: |
+          $plugin = Join-Path $env:GITHUB_WORKSPACE 'plugin'
+          $actualPlugin = (git -C $plugin rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualPlugin -ne $env:PLUGIN_SHA) { throw 'Plugin checkout differs from pinned SHA.' }
+          $expected = (git -C $plugin rev-parse 'HEAD:submodules/rive-runtime').Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read runtime gitlink.' }
+          $runtime = Join-Path $plugin 'submodules/rive-runtime'
+          $actual = (git -C $runtime rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $expected) { throw 'Runtime checkout differs from plugin gitlink.' }
+          if ($env:EXPECTED_RUNTIME_SHA -and $actual -ne $env:EXPECTED_RUNTIME_SHA) { throw 'Runtime SHA differs from existing release metadata.' }
+          "runtime_sha=$actual" >> $env:GITHUB_OUTPUT
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          if (-not [System.IO.File]::Exists($vswhere)) { throw 'vswhere.exe is missing.' }
+          $installation = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Visual Studio C++ tools are missing.' }
+          $msvcRoot = Join-Path $installation 'VC/Tools/MSVC'
+          if (-not [System.IO.Directory]::Exists($msvcRoot)) { throw "MSVC_ROOT is missing: $msvcRoot" }
+          "MSVC_ROOT=$msvcRoot" >> $env:GITHUB_ENV
+
+      - name: Remove prebuilt runtime output
+        shell: pwsh
+        run: |
+          @(
+            'plugin/Source/ThirdParty/RiveLibrary/Libraries',
+            'plugin/Source/ThirdParty/RiveLibrary/Includes',
+            'plugin/Shaders/Private/Rive'
+          ) | ForEach-Object {
+            if ([System.IO.Directory]::Exists($_)) {
+              [System.IO.Directory]::Delete([System.IO.Path]::GetFullPath($_), $true)
+            }
+          }
+
+      - name: Build Win64 Rive runtime
+        shell: pwsh
+        run: |
+          python plugin/Scripts/build-rive/build-rive.py -r --disable_lto -p "$env:GITHUB_WORKSPACE/plugin/submodules/rive-runtime" Windows
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -ne 0) { exit $buildExit }
+
+      - name: Upload generated runtime files
+        uses: actions/upload-artifact@v4
+        with:
+          name: rive-runtime-win64
+          if-no-files-found: error
+          # The common root is plugin/, preserving Source/ and Shaders/ inside the artifact.
+          path: |
+            plugin/Source/ThirdParty/RiveLibrary/Libraries/Win64
+            plugin/Source/ThirdParty/RiveLibrary/Includes
+            plugin/Shaders/Private/Rive
+
+  package-and-release:
+    needs: [resolve, build-runtime-win64]
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      PLUGIN_SHA: ${{ needs.resolve.outputs.plugin_sha }}
+      RUNTIME_SHA: ${{ needs.build-runtime-win64.outputs.runtime_sha }}
+      CI_SHA: ${{ needs.resolve.outputs.ci_sha }}
+    steps:
+      - name: Check out pinned CI tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SHA }}
+          path: ci
+          persist-credentials: false
+
+      - name: Check out pinned upstream plugin source
+        uses: actions/checkout@v4
+        with:
+          repository: rive-app/rive-unreal
+          ref: ${{ env.PLUGIN_SHA }}
+          path: plugin
+          lfs: false
+          persist-credentials: false
+
+      - name: Remove prebuilt runtime output
+        shell: bash
+        run: |
+          rm -rf plugin/Source/ThirdParty/RiveLibrary/Libraries plugin/Source/ThirdParty/RiveLibrary/Includes plugin/Shaders/Private/Rive
+
+      - name: Download generated runtime files
+        uses: actions/download-artifact@v4
+        with:
+          name: rive-runtime-win64
+          path: plugin
+
+      - name: Validate and package plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          python ci/Scripts/package_ci_release.py --plugin-root plugin --version "$UPSTREAM_TAG" --output RiveUnreal-Win64.zip
+          test -s RiveUnreal-Win64.zip
+
+      - name: Publish CI release
+        shell: bash
+        run: |
+          set -euo pipefail
+          refs=$(jq -nc --arg upstreamTag "$UPSTREAM_TAG" --arg pluginSha "$PLUGIN_SHA" --arg runtimeSha "$RUNTIME_SHA" --arg ciSha "$CI_SHA" \
+            '{upstreamTag:$upstreamTag, pluginSha:$pluginSha, runtimeSha:$runtimeSha, ciSha:$ciSha}')
+          notes="<!-- rive-ci-refs: $refs -->
+          Upstream release: $UPSTREAM_TAG
+          Upstream plugin main commit: $PLUGIN_SHA
+          Rive runtime gitlink commit: $RUNTIME_SHA
+          CI commit: $CI_SHA
+
+          Contains plugin source and Win64 native libraries. UE5 compiles plugin modules when installed."
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            api_url=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq '.apiUrl')
+            existing=$(gh api "$api_url")
+            mapfile -t invalid_assets < <(jq -r --arg name 'RiveUnreal-Win64.zip' \
+              '.assets[] | select(.name == $name and (.state != "uploaded" or (.size // 0) <= 0)) | .id' <<< "$existing")
+            for asset_id in "${invalid_assets[@]}"; do
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            done
+            if ! jq -e --arg name 'RiveUnreal-Win64.zip' \
+              '[.assets[] | select(.name == $name and .state == "uploaded" and (.size // 0) > 0)] | length > 0' \
+              <<< "$existing" >/dev/null; then
+              gh release upload "$RELEASE_TAG" RiveUnreal-Win64.zip --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$CI_SHA" --title "$RELEASE_TAG source plugin" --notes "$notes" --draft
+            gh release upload "$RELEASE_TAG" RiveUnreal-Win64.zip --repo "$GITHUB_REPOSITORY"
+          fi
+          api_url=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq '.apiUrl')
+          existing=$(gh api "$api_url")
+          if ! jq -e --arg name 'RiveUnreal-Win64.zip' \
+            '[.assets[] | select(.name == $name and .state == "uploaded" and (.size // 0) > 0)] | length > 0' \
+            <<< "$existing" >/dev/null; then
+            echo 'Release zip was not uploaded completely; refusing to finalize the release.' >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG source plugin" --notes "$notes" --draft=false
+
+  finalize-draft:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'finalize'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+    steps:
+      - name: Publish draft with existing zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_url=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq '.apiUrl')
+          existing=$(gh api "$api_url")
+          if ! jq -e --arg name 'RiveUnreal-Win64.zip' \
+            '[.assets[] | select(.name == $name and .state == "uploaded" and (.size // 0) > 0)] | length > 0' \
+            <<< "$existing" >/dev/null; then
+            echo 'Draft has no uploaded, nonempty release zip.' >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
