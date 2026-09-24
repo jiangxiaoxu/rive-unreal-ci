@@ -159,6 +159,16 @@ jobs:
       PLUGIN_SHA: ${{ needs.resolve.outputs.plugin_sha }}
       EXPECTED_RUNTIME_SHA: ${{ needs.resolve.outputs.runtime_sha }}
     steps:
+      - name: Enable long paths in Git
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          $configExit = $LASTEXITCODE
+          if ($configExit -ne 0) { exit $configExit }
+          $configured = (git config --global --get core.longpaths).Trim()
+          $readExit = $LASTEXITCODE
+          if ($readExit -ne 0 -or $configured -ne 'true') { throw 'Git long path support was not enabled.' }
+
       - name: Check out CI tools at pinned commit
         uses: actions/checkout@v4
         with:
@@ -217,6 +227,22 @@ jobs:
           python plugin/Scripts/build-rive/build-rive.py -r --disable_lto -p "$env:GITHUB_WORKSPACE/plugin/submodules/rive-runtime" Windows
           $buildExit = $LASTEXITCODE
           if ($buildExit -ne 0) { exit $buildExit }
+          $plugin = Join-Path $env:GITHUB_WORKSPACE 'plugin'
+          $libs = Join-Path $plugin 'Source/ThirdParty/RiveLibrary/Libraries/Win64'
+          $includes = Join-Path $plugin 'Source/ThirdParty/RiveLibrary/Includes'
+          $shaders = Join-Path $plugin 'Shaders/Private/Rive/Generated'
+          foreach ($directory in @($libs, $includes, $shaders)) {
+            if (-not [System.IO.Directory]::Exists($directory)) { throw "Runtime build output is missing: $directory" }
+          }
+          foreach ($name in @('rive.lib', 'rive_d.lib', 'rive_pls_renderer.lib', 'rive_pls_renderer_d.lib')) {
+            $library = Join-Path $libs $name
+            if (-not [System.IO.File]::Exists($library)) { throw "Runtime library is missing: $library" }
+          }
+          $header = Join-Path $includes 'rive/file.hpp'
+          if (-not [System.IO.File]::Exists($header)) { throw "Runtime header is missing: $header" }
+          if (@(Get-ChildItem -LiteralPath $shaders -Filter '*.ush' -File).Count -eq 0) {
+            throw "Generated runtime shaders are missing: $shaders"
+          }
 
       - name: Upload generated runtime files
         uses: actions/upload-artifact@v4
