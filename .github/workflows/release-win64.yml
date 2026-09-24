@@ -366,3 +366,48 @@ jobs:
             exit 1
           fi
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  prune-releases:
+    needs: [resolve, package-and-release, finalize-draft]
+    if: >-
+      ${{
+        always() &&
+        needs.resolve.result == 'success' &&
+        (
+          needs.resolve.outputs.build == 'false' ||
+          (needs.resolve.outputs.build == 'true' && needs['package-and-release'].result == 'success') ||
+          (needs.resolve.outputs.build == 'finalize' && needs['finalize-draft'].result == 'success')
+        )
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KEEP_RELEASES: '5'
+    steps:
+      - name: Keep the newest published Win64 releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$KEEP_RELEASES" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'KEEP_RELEASES must be a positive integer.' >&2
+            exit 1
+          fi
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/all-releases.json"
+          jq -e '
+            type == "array" and
+            all(.[]; type == "array" and all(.[];
+              (.draft | type) == "boolean" and
+              (.tag_name | type) == "string" and
+              (.published_at == null or (.published_at | type) == "string")
+            ))
+          ' "$RUNNER_TEMP/all-releases.json" >/dev/null
+          jq -r --argjson keep "$KEEP_RELEASES" '
+            [.[][] | select(.draft == false and .published_at != null and (.tag_name | startswith("win64-")))]
+            | sort_by(.published_at, .id) | reverse | .[$keep:] | .[].tag_name
+          ' "$RUNNER_TEMP/all-releases.json" > "$RUNNER_TEMP/prune-tags.txt"
+          while IFS= read -r tag; do
+            echo "Deleting old Win64 release and tag: $tag"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done < "$RUNNER_TEMP/prune-tags.txt"

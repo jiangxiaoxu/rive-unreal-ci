@@ -16,6 +16,8 @@ To rerun or build a specific published upstream release, use **Actions >
 Release Rive Unreal Win64 source plugin > Run workflow** and optionally enter its tag. An existing
 complete `win64-<upstream tag>` release is left unchanged. The release notes
 record the exact upstream plugin and runtime commits used for the build.
+After a successful run, the workflow keeps the 5 newest published Win64
+releases and their CI tags. Drafts and unrelated releases are left alone.
 
 Download `RiveUnreal-Win64.zip` from this repository's Releases page. GitHub's
 automatic "Source code" archives contain this CI repository, not the plugin.
