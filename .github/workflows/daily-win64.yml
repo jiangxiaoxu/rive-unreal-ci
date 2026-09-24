@@ -38,6 +38,20 @@ jobs:
             echo 'Could not resolve upstream main or CI commit.' >&2
             exit 1
           fi
+          ci_main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')
+          if [[ ! "$ci_main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Cannot resolve CI repository main commit.' >&2
+            exit 1
+          fi
+          verify_main_ancestor() {
+            local tag_name=$1 tag_sha=$2 comparison
+            if ! comparison=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_sha}...${ci_main_sha}" --jq '.status'); then
+              echo "Cannot compare tag $tag_name with CI repository main." >&2; return 1
+            fi
+            if [[ "$comparison" != ahead && "$comparison" != identical ]]; then
+              echo "Tag $tag_name does not point to a commit in CI repository main history." >&2; return 1
+            fi
+          }
           date=$(TZ=Asia/Shanghai date +%Y%m%d)
           release_tag="daily-${date}-${main_sha:0:12}"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
@@ -69,14 +83,15 @@ jobs:
                   tag_type=$(jq -r '.object.type' <<< "$tag_object")
                   tag_sha=$(jq -r '.object.sha' <<< "$tag_object")
                 fi
-                if [[ "$tag_type" != commit || "$tag_sha" != "$pinned_ci" ]]; then
-                  echo "Daily tag $release_tag does not point to its pinned CI commit." >&2
+                if [[ "$tag_type" != commit || ! "$tag_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "Daily tag $release_tag does not point to a commit." >&2
                   exit 1
                 fi
+                verify_main_ancestor "$release_tag" "$tag_sha"
                 ;;
               404)
                 if [[ "$(jq -r '.draft' <<< "$existing")" != true ||
-                      "$(jq -r '.target_commitish // empty' <<< "$existing")" != "$pinned_ci" ]]; then
+                      "$(jq -r '.target_commitish // empty' <<< "$existing")" != main ]]; then
                   echo "Daily $release_tag has no matching tag or draft target." >&2
                   exit 1
                 fi

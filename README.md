@@ -27,7 +27,9 @@ page; GitHub's automatic "Source code" archives contain this CI repository.
 
 Both workflows can also be run manually from Actions. A complete existing
 release is left unchanged. Release notes record the exact upstream plugin and
-runtime commits used for each build.
+runtime commits and CI commit used for each build. Release tags point to this
+repository's `main` at publication, so the release notes identify the exact
+CI code used when a build was started.
 
 Scheduled GitHub Actions can be delayed and may be disabled after 60 days of
 repository inactivity. Re-enable the workflows in Actions if that happens.

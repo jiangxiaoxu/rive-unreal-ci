@@ -224,6 +224,19 @@ jobs:
               -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"
           }
+          main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')
+          if [[ ! "$main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Cannot resolve CI repository main commit.' >&2; exit 1
+          fi
+          verify_main_ancestor() {
+            local tag_name=$1 tag_sha=$2 comparison
+            if ! comparison=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_sha}...${main_sha}" --jq '.status'); then
+              echo "Cannot compare tag $tag_name with CI repository main." >&2; return 1
+            fi
+            if [[ "$comparison" != ahead && "$comparison" != identical ]]; then
+              echo "Tag $tag_name does not point to a commit in CI repository main history." >&2; return 1
+            fi
+          }
           tag_status=$(api_status "git/ref/tags/${RELEASE_TAG}")
           case "$tag_status" in
             200)
@@ -235,9 +248,10 @@ jobs:
                 tag_type=$(jq -r '.object.type' <<< "$tag_object")
                 tag_sha=$(jq -r '.object.sha' <<< "$tag_object")
               fi
-              if [[ "$tag_type" != commit || "$tag_sha" != "$CI_SHA" ]]; then
-                echo "CI tag $RELEASE_TAG does not point to pinned CI commit." >&2; exit 1
+              if [[ "$tag_type" != commit || ! "$tag_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "CI tag $RELEASE_TAG does not point to a commit." >&2; exit 1
               fi
+              verify_main_ancestor "$RELEASE_TAG" "$tag_sha"
               ;;
             404) tag_ref='' ;;
             *) echo "Cannot inspect CI tag $RELEASE_TAG (HTTP $tag_status)." >&2; exit 1 ;;
@@ -256,7 +270,7 @@ jobs:
                 echo "Existing release $RELEASE_TAG has different pinned metadata." >&2; exit 1
               fi
               if [[ -z "$tag_ref" ]]; then
-                if [[ "$(jq -r '.draft' <<< "$existing")" != true || "$(jq -r '.target_commitish' <<< "$existing")" != "$CI_SHA" ]]; then
+                if [[ "$(jq -r '.draft' <<< "$existing")" != true || "$(jq -r '.target_commitish' <<< "$existing")" != main ]]; then
                   echo "Release $RELEASE_TAG has no matching CI tag." >&2; exit 1
                 fi
               fi
@@ -269,7 +283,7 @@ jobs:
               if [[ -n "$tag_ref" ]]; then
                 echo "CI tag $RELEASE_TAG exists without a release." >&2; exit 1
               fi
-              create_flags=(--repo "$GITHUB_REPOSITORY" --target "$CI_SHA" --title "$RELEASE_TAG source plugin" --notes-file "$RUNNER_TEMP/release-notes.md" --draft)
+              create_flags=(--repo "$GITHUB_REPOSITORY" --target main --title "$RELEASE_TAG source plugin" --notes-file "$RUNNER_TEMP/release-notes.md" --draft)
               if [[ "$CHANNEL" == daily ]]; then create_flags+=(--prerelease --latest=false); fi
               gh release create "$RELEASE_TAG" "${create_flags[@]}"
               api_url=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq '.apiUrl')
@@ -292,7 +306,7 @@ jobs:
             <<< "$existing" >/dev/null; then
             echo 'Release zip was not uploaded completely.' >&2; exit 1
           fi
-          edit_flags=(--repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG source plugin" --notes-file "$RUNNER_TEMP/release-notes.md" --draft=false)
+          edit_flags=(--repo "$GITHUB_REPOSITORY" --target main --title "$RELEASE_TAG source plugin" --notes-file "$RUNNER_TEMP/release-notes.md" --draft=false)
           if [[ "$CHANNEL" == daily ]]; then edit_flags+=(--prerelease --latest=false); fi
           gh release edit "$RELEASE_TAG" "${edit_flags[@]}"
 
@@ -301,12 +315,17 @@ jobs:
             marker_status=$(api_status "git/ref/tags/${marker_tag}")
             case "$marker_status" in
               200)
-                if [[ "$(jq -r '.object.type' "$RUNNER_TEMP/api-response.json")" != commit || "$(jq -r '.object.sha' "$RUNNER_TEMP/api-response.json")" != "$CI_SHA" ]]; then
-                  echo "Completion tag $marker_tag points to another commit." >&2; exit 1
+                if [[ "$(jq -r '.object.type' "$RUNNER_TEMP/api-response.json")" != commit ]]; then
+                  echo "Completion tag $marker_tag does not point to a commit." >&2; exit 1
                 fi
+                marker_sha=$(jq -r '.object.sha' "$RUNNER_TEMP/api-response.json")
+                if [[ ! "$marker_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "Completion tag $marker_tag has an invalid commit." >&2; exit 1
+                fi
+                verify_main_ancestor "$marker_tag" "$marker_sha"
                 ;;
               404)
-                gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" -f "ref=refs/tags/${marker_tag}" -f "sha=${CI_SHA}" >/dev/null
+                gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" -f "ref=refs/tags/${marker_tag}" -f "sha=${main_sha}" >/dev/null
                 ;;
               *) echo "Cannot inspect completion tag $marker_tag (HTTP $marker_status)." >&2; exit 1 ;;
             esac

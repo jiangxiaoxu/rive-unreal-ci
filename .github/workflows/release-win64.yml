@@ -40,6 +40,20 @@ jobs:
             echo "Unsupported upstream tag: $REQUESTED_TAG" >&2
             exit 1
           fi
+          main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')
+          if [[ ! "$main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Cannot resolve CI repository main commit.' >&2
+            exit 1
+          fi
+          verify_main_ancestor() {
+            local tag_name=$1 tag_sha=$2 comparison
+            if ! comparison=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_sha}...${main_sha}" --jq '.status'); then
+              echo "Cannot compare tag $tag_name with CI repository main." >&2; return 1
+            fi
+            if [[ "$comparison" != ahead && "$comparison" != identical ]]; then
+              echo "Tag $tag_name does not point to a commit in CI repository main history." >&2; return 1
+            fi
+          }
 
           gh api --paginate --slurp 'repos/rive-app/rive-unreal/releases?per_page=100' > "$RUNNER_TEMP/upstream-releases.json"
           jq -e '
@@ -80,7 +94,16 @@ jobs:
               -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${marker_tag}")
             case "$marker_status" in
-              200) echo "Already built upstream release $upstream_id ($upstream_tag)."; continue ;;
+              200)
+                marker_type=$(jq -r '.object.type' "$RUNNER_TEMP/built-tag.json")
+                marker_sha=$(jq -r '.object.sha' "$RUNNER_TEMP/built-tag.json")
+                if [[ "$marker_type" != commit || ! "$marker_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "Completion marker $marker_tag does not point to a commit." >&2; exit 1
+                fi
+                verify_main_ancestor "$marker_tag" "$marker_sha"
+                echo "Already built upstream release $upstream_id ($upstream_tag)."
+                continue
+                ;;
               404) ;;
               *) echo "Cannot inspect completion marker $marker_tag (HTTP $marker_status)." >&2; exit 1 ;;
             esac
@@ -140,14 +163,15 @@ jobs:
                     display_type=$(jq -r '.object.type' <<< "$display_object")
                     display_sha=$(jq -r '.object.sha' <<< "$display_object")
                   fi
-                  if [[ "$display_type" != commit || "$display_sha" != "$ci_sha" ]]; then
-                    echo "Stable display tag $release_tag does not point to pinned CI commit." >&2
+                  if [[ "$display_type" != commit || ! "$display_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                    echo "Stable display tag $release_tag does not point to a commit." >&2
                     exit 1
                   fi
+                  verify_main_ancestor "$release_tag" "$display_sha"
                   ;;
                 404)
                   if [[ "$(jq -r '.draft' <<< "$existing")" != true ||
-                        "$(jq -r '.target_commitish // empty' <<< "$existing")" != "$ci_sha" ]]; then
+                        "$(jq -r '.target_commitish // empty' <<< "$existing")" != main ]]; then
                     echo "Stable release $release_tag has no matching CI tag or draft target." >&2
                     exit 1
                   fi
@@ -158,10 +182,15 @@ jobs:
                 '[.assets[] | select(.name == $name and .state == "uploaded" and (.size // 0) > 0)] | length > 0' \
                 <<< "$existing" >/dev/null; then
                 if [[ "$(jq -r '.draft' <<< "$existing")" == true ]]; then
-                  gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false
+                  gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --target main --draft=false
+                fi
+                marker_main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')
+                if [[ ! "$marker_main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo 'Cannot resolve CI repository main commit for completion marker.' >&2
+                  exit 1
                 fi
                 gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-                  -f "ref=refs/tags/${marker_tag}" -f "sha=$ci_sha" >/dev/null
+                  -f "ref=refs/tags/${marker_tag}" -f "sha=$marker_main_sha" >/dev/null
                 echo "Repaired completion marker for $release_tag."
                 continue
               fi
