@@ -195,7 +195,7 @@ jobs:
             echo 'This workflow only publishes from jiangxiaoxu/rive-unreal-ci.' >&2
             exit 1
           fi
-          if [[ "$CHANNEL" != stable && "$CHANNEL" != nightly ]]; then
+          if [[ "$CHANNEL" != stable && "$CHANNEL" != daily ]]; then
             echo 'Unknown release channel.' >&2; exit 1
           fi
           if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || ! "$VERSION_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || ! "$PLUGIN_SHA" =~ ^[0-9a-f]{40}$ || ! "$RUNTIME_SHA" =~ ^[0-9a-f]{40}$ || ! "$CI_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -204,7 +204,7 @@ jobs:
           if [[ -n "$UPSTREAM_RELEASE_ID" && ! "$UPSTREAM_RELEASE_ID" =~ ^[0-9]+$ ]]; then
             echo 'Invalid upstream release ID.' >&2; exit 1
           fi
-          if [[ "$CHANNEL" == stable && -z "$UPSTREAM_TAG" || "$CHANNEL" == nightly && -n "$UPSTREAM_TAG$UPSTREAM_RELEASE_ID$UPSTREAM_PUBLISHED_AT" ]]; then
+          if [[ "$CHANNEL" == stable && -z "$UPSTREAM_TAG" || "$CHANNEL" == daily && -n "$UPSTREAM_TAG$UPSTREAM_RELEASE_ID$UPSTREAM_PUBLISHED_AT" ]]; then
             echo 'Invalid upstream release fields for channel.' >&2; exit 1
           fi
 
@@ -261,7 +261,7 @@ jobs:
                 fi
               fi
               expected_prerelease=false
-              if [[ "$CHANNEL" == nightly ]]; then expected_prerelease=true; fi
+              if [[ "$CHANNEL" == daily ]]; then expected_prerelease=true; fi
               if [[ "$(jq -r '.prerelease' <<< "$existing")" != "$expected_prerelease" ]]; then
                 echo "Release $RELEASE_TAG has an unexpected prerelease flag." >&2; exit 1
               fi
@@ -270,7 +270,7 @@ jobs:
                 echo "CI tag $RELEASE_TAG exists without a release." >&2; exit 1
               fi
               create_flags=(--repo "$GITHUB_REPOSITORY" --target "$CI_SHA" --title "$RELEASE_TAG source plugin" --notes-file "$RUNNER_TEMP/release-notes.md" --draft)
-              if [[ "$CHANNEL" == nightly ]]; then create_flags+=(--prerelease --latest=false); fi
+              if [[ "$CHANNEL" == daily ]]; then create_flags+=(--prerelease --latest=false); fi
               gh release create "$RELEASE_TAG" "${create_flags[@]}"
               api_url=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq '.apiUrl')
               existing=$(gh api "$api_url")
@@ -293,7 +293,7 @@ jobs:
             echo 'Release zip was not uploaded completely.' >&2; exit 1
           fi
           edit_flags=(--repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG source plugin" --notes-file "$RUNNER_TEMP/release-notes.md" --draft=false)
-          if [[ "$CHANNEL" == nightly ]]; then edit_flags+=(--prerelease --latest=false); fi
+          if [[ "$CHANNEL" == daily ]]; then edit_flags+=(--prerelease --latest=false); fi
           gh release edit "$RELEASE_TAG" "${edit_flags[@]}"
 
           if [[ "$CHANNEL" == stable && -n "$UPSTREAM_RELEASE_ID" ]]; then

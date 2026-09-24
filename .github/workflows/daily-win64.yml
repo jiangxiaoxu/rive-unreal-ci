@@ -1,4 +1,4 @@
-name: Nightly Rive Unreal Win64 source plugin
+name: Daily Rive Unreal Win64 source plugin
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: rive-unreal-nightly-win64
+  group: rive-unreal-daily-win64
   cancel-in-progress: false
 
 jobs:
@@ -39,7 +39,7 @@ jobs:
             exit 1
           fi
           date=$(TZ=Asia/Shanghai date +%Y%m%d)
-          release_tag="nightly-${date}-${main_sha:0:12}"
+          release_tag="daily-${date}-${main_sha:0:12}"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
 
           if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -47,41 +47,41 @@ jobs:
             existing=$(gh api "$api_url")
             marker=$(jq -r '.body // ""' <<< "$existing" | sed -n 's/^<!-- rive-ci-refs: \(.*\) -->$/\1/p' | head -n 1)
             if [[ -z "$marker" ]] || ! jq -e . <<< "$marker" >/dev/null; then
-              echo "Nightly $release_tag lacks pinned commit metadata." >&2
+              echo "Daily $release_tag lacks pinned commit metadata." >&2
               exit 1
             fi
             pinned_channel=$(jq -r '.channel // empty' <<< "$marker")
             pinned_plugin=$(jq -r '.pluginSha // empty' <<< "$marker")
             pinned_ci=$(jq -r '.ciSha // empty' <<< "$marker")
-            if [[ "$pinned_channel" != nightly || "$pinned_plugin" != "$main_sha" || ! "$pinned_ci" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "Nightly $release_tag metadata does not match the selected main commit." >&2
+            if [[ "$pinned_channel" != daily || "$pinned_plugin" != "$main_sha" || ! "$pinned_ci" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Daily $release_tag metadata does not match the selected main commit." >&2
               exit 1
             fi
-            tag_status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/nightly-ref.json" --write-out '%{http_code}' \
+            tag_status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/daily-ref.json" --write-out '%{http_code}' \
               -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}")
             case "$tag_status" in
               200)
-                tag_type=$(jq -r '.object.type' "$RUNNER_TEMP/nightly-ref.json")
-                tag_sha=$(jq -r '.object.sha' "$RUNNER_TEMP/nightly-ref.json")
+                tag_type=$(jq -r '.object.type' "$RUNNER_TEMP/daily-ref.json")
+                tag_sha=$(jq -r '.object.sha' "$RUNNER_TEMP/daily-ref.json")
                 if [[ "$tag_type" == tag && "$tag_sha" =~ ^[0-9a-f]{40}$ ]]; then
                   tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}")
                   tag_type=$(jq -r '.object.type' <<< "$tag_object")
                   tag_sha=$(jq -r '.object.sha' <<< "$tag_object")
                 fi
                 if [[ "$tag_type" != commit || "$tag_sha" != "$pinned_ci" ]]; then
-                  echo "Nightly tag $release_tag does not point to its pinned CI commit." >&2
+                  echo "Daily tag $release_tag does not point to its pinned CI commit." >&2
                   exit 1
                 fi
                 ;;
               404)
                 if [[ "$(jq -r '.draft' <<< "$existing")" != true ||
                       "$(jq -r '.target_commitish // empty' <<< "$existing")" != "$pinned_ci" ]]; then
-                  echo "Nightly $release_tag has no matching tag or draft target." >&2
+                  echo "Daily $release_tag has no matching tag or draft target." >&2
                   exit 1
                 fi
                 ;;
-              *) echo "Cannot inspect nightly tag (HTTP $tag_status)." >&2; exit 1 ;;
+              *) echo "Cannot inspect daily tag (HTTP $tag_status)." >&2; exit 1 ;;
             esac
             if jq -e --arg name 'RiveUnreal-Win64.zip' \
               '[.assets[] | select(.name == $name and .state == "uploaded" and (.size // 0) > 0)] | length > 0' \
@@ -89,7 +89,7 @@ jobs:
               if [[ "$(jq -r '.draft' <<< "$existing")" == true ]]; then
                 gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
               fi
-              echo 'Nightly for this main commit is already published.'
+              echo 'Daily for this main commit is already published.'
               echo 'build=false' >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -100,28 +100,28 @@ jobs:
           fi
 
           # A tag without its release cannot tell us which upstream commit was packaged.
-          status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/nightly-ref.json" --write-out '%{http_code}' \
+          status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/daily-ref.json" --write-out '%{http_code}' \
             -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}")
           case "$status" in
             404) ;;
-            200) echo "Nightly tag $release_tag exists without a release." >&2; exit 1 ;;
-            *) echo "Cannot inspect nightly tag (HTTP $status)." >&2; exit 1 ;;
+            200) echo "Daily tag $release_tag exists without a release." >&2; exit 1 ;;
+            *) echo "Cannot inspect daily tag (HTTP $status)." >&2; exit 1 ;;
           esac
 
           releases=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
           last_sha=$(jq -r '
             [.[][]
-             | select(.draft == false and (.tag_name | startswith("nightly-")))
+             | select(.draft == false and (.tag_name | startswith("daily-")))
              | . as $release
              | (($release.body // "") | split("\n")[0] | ltrimstr("<!-- rive-ci-refs: ") | rtrimstr(" -->") | fromjson?) as $refs
-             | select($refs.channel == "nightly")
+             | select($refs.channel == "daily")
              | select([$release.assets[] | select(.name == "RiveUnreal-Win64.zip" and .state == "uploaded" and (.size // 0) > 0)] | length > 0)
              | {published: $release.published_at, id: $release.id, sha: $refs.pluginSha}]
             | sort_by(.published, .id) | reverse | .[0].sha // empty
           ' <<< "$releases")
           if [[ "$last_sha" == "$main_sha" ]]; then
-            echo "Upstream main remains at $main_sha; skipping nightly."
+            echo "Upstream main remains at $main_sha; skipping daily."
             echo 'build=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -130,14 +130,14 @@ jobs:
           echo "ci_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo 'build=true' >> "$GITHUB_OUTPUT"
 
-  build-nightly:
+  build-daily:
     needs: resolve
     if: needs.resolve.outputs.build == 'true'
     uses: ./.github/workflows/build-win64.yml
     permissions:
       contents: write
     with:
-      channel: nightly
+      channel: daily
       release_tag: ${{ needs.resolve.outputs.release_tag }}
       version_name: ${{ needs.resolve.outputs.release_tag }}
       plugin_sha: ${{ needs.resolve.outputs.plugin_sha }}
@@ -146,38 +146,38 @@ jobs:
       upstream_release_id: ''
       upstream_published_at: ''
 
-  prune-nightly:
-    needs: [resolve, build-nightly]
+  prune-daily:
+    needs: [resolve, build-daily]
     if: >-
       ${{ always() && needs.resolve.result == 'success' &&
-          (needs.resolve.outputs.build == 'false' || needs.build-nightly.result == 'success') }}
+          (needs.resolve.outputs.build == 'false' || needs.build-daily.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Keep the newest published nightly
+      - name: Keep the newest published daily
         shell: bash
         run: |
           set -euo pipefail
-          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/nightlies.json"
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/dailies.json"
           jq -e '
             type == "array" and all(.[]; type == "array" and all(.[];
               (.draft | type) == "boolean" and (.tag_name | type) == "string" and
               (.published_at == null or (.published_at | type) == "string")
             ))
-          ' "$RUNNER_TEMP/nightlies.json" >/dev/null
+          ' "$RUNNER_TEMP/dailies.json" >/dev/null
           jq -r '
             [.[][]
-             | select(.draft == false and .published_at != null and (.tag_name | startswith("nightly-")))
+             | select(.draft == false and .published_at != null and (.tag_name | startswith("daily-")))
              | . as $release
              | (($release.body // "") | split("\n")[0] | ltrimstr("<!-- rive-ci-refs: ") | rtrimstr(" -->") | fromjson?) as $refs
-             | select($refs.channel == "nightly")
+             | select($refs.channel == "daily")
              | {tag: $release.tag_name, published: $release.published_at, id: $release.id}]
             | sort_by(.published, .id) | reverse | .[1:] | .[].tag
-          ' "$RUNNER_TEMP/nightlies.json" > "$RUNNER_TEMP/prune-nightly-tags.txt"
+          ' "$RUNNER_TEMP/dailies.json" > "$RUNNER_TEMP/prune-daily-tags.txt"
           while IFS= read -r tag; do
-            echo "Deleting old nightly release and tag: $tag"
+            echo "Deleting old daily release and tag: $tag"
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-          done < "$RUNNER_TEMP/prune-nightly-tags.txt"
+          done < "$RUNNER_TEMP/prune-daily-tags.txt"

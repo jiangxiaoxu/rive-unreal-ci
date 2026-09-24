@@ -14,10 +14,10 @@ The 2 newest stable packages are retained. Monitoring starts with upstream
 tags record completed upstream releases so pruning a package does not rebuild
 it on the next check.
 
-The [nightly workflow](.github/workflows/nightly-win64.yml) checks upstream
+The [daily workflow](.github/workflows/daily-win64.yml) checks upstream
 `main` at 08:00 China time (00:00 UTC). It builds only when `main` differs
-from the most recently published nightly. Nightlies are prereleases named
-`nightly-<date>-<commit>`; only the newest nightly is retained.
+from the most recently published daily build. Daily builds are prereleases named
+`daily-<date>-<commit>`; only the newest daily build is retained.
 
 Both channels use GitHub-hosted Windows to build the Rive runtime and Ubuntu
 to assemble `RiveUnreal-Win64.zip`. The zip contains plugin source, headers,
