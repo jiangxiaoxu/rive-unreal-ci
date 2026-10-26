@@ -1,6 +1,12 @@
 name: Daily Rive Unreal Win64 source plugin
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/daily-win64.yml'
+      - '.github/workflows/build-win64.yml'
+      - 'Scripts/package_ci_release.py'
   schedule:
     # 00:00 UTC is 08:00 in Asia/Shanghai.
     - cron: '0 0 * * *'

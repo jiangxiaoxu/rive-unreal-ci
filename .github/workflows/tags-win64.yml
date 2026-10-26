@@ -1,0 +1,191 @@
+name: Build upstream Rive Unreal tags for Win64
+
+on:
+  schedule:
+    - cron: '37 * * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tags-win64.yml'
+      - '.github/workflows/build-win64.yml'
+      - '.github/upstream-tags-baseline.json'
+      - 'Scripts/package_ci_release.py'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Optional upstream tag to build, including a historical tag'
+        required: false
+        type: string
+
+concurrency:
+  group: rive-unreal-tags-win64
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      matrix: ${{ steps.tags.outputs.matrix }}
+      count: ${{ steps.tags.outputs.count }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REQUESTED_TAG: ${{ inputs.upstream_tag }}
+    steps:
+      - name: Check out tag baseline
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Discover unbuilt upstream tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != 'jiangxiaoxu/rive-unreal-ci' ]]; then
+            echo 'This workflow only publishes from jiangxiaoxu/rive-unreal-ci.' >&2
+            exit 1
+          fi
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ||
+                ( -n "$REQUESTED_TAG" && ! "$REQUESTED_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ) ]]; then
+            echo 'Invalid CI commit or unsupported upstream tag.' >&2
+            exit 1
+          fi
+          main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')
+          if [[ ! "$main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Cannot resolve CI repository main commit.' >&2
+            exit 1
+          fi
+          verify_main_ancestor() {
+            local tag_name=$1 tag_sha=$2 comparison
+            comparison=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_sha}...${main_sha}" --jq '.status')
+            if [[ "$comparison" != ahead && "$comparison" != identical ]]; then
+              echo "Tag $tag_name does not point to a commit in CI repository main history." >&2
+              return 1
+            fi
+          }
+
+          jq -e '.tags | type == "array" and all(.[]; type == "string")' \
+            .github/upstream-tags-baseline.json >/dev/null
+          gh api --paginate --slurp 'repos/rive-app/rive-unreal/tags?per_page=100' > "$RUNNER_TEMP/upstream-tags.json"
+          jq -e 'type == "array" and all(.[]; type == "array" and all(.[]; (.name | type) == "string"))' \
+            "$RUNNER_TEMP/upstream-tags.json" >/dev/null
+          jq -r --arg requested "$REQUESTED_TAG" --slurpfile baseline .github/upstream-tags-baseline.json '
+            [.[][] | .name |
+              select(if $requested != "" then . == $requested
+                else . as $tag | ($baseline[0].tags | index($tag)) == null end)
+            ] | unique | .[]
+          ' "$RUNNER_TEMP/upstream-tags.json" > "$RUNNER_TEMP/candidate-tags.txt"
+          if [[ -n "$REQUESTED_TAG" && ! -s "$RUNNER_TEMP/candidate-tags.txt" ]]; then
+            echo "Upstream tag $REQUESTED_TAG does not exist." >&2
+            exit 1
+          fi
+
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/ci-releases.json"
+          jq -e 'type == "array" and all(.[]; type == "array" and all(.[];
+            (.tag_name | type) == "string" and (.draft | type) == "boolean" and
+            (.prerelease | type) == "boolean" and (.assets | type) == "array"))' \
+            "$RUNNER_TEMP/ci-releases.json" >/dev/null
+
+          : > "$RUNNER_TEMP/tag-matrix.jsonl"
+          while IFS= read -r upstream_tag; do
+            if [[ ! "$upstream_tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+              echo "Unsupported upstream tag: $upstream_tag" >&2
+              exit 1
+            fi
+            upstream_ref=$(gh api "repos/rive-app/rive-unreal/git/ref/tags/${upstream_tag}")
+            object_type=$(jq -r '.object.type' <<< "$upstream_ref")
+            plugin_sha=$(jq -r '.object.sha' <<< "$upstream_ref")
+            while [[ "$object_type" == tag && "$plugin_sha" =~ ^[0-9a-f]{40}$ ]]; do
+              tag_object=$(gh api "repos/rive-app/rive-unreal/git/tags/${plugin_sha}")
+              object_type=$(jq -r '.object.type' <<< "$tag_object")
+              plugin_sha=$(jq -r '.object.sha' <<< "$tag_object")
+            done
+            if [[ "$object_type" != commit || ! "$plugin_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Upstream tag $upstream_tag does not resolve to a commit." >&2
+              exit 1
+            fi
+            release_tag="tag-$upstream_tag"
+            ci_sha=$GITHUB_SHA
+            existing=$(jq -c --arg tag "$release_tag" \
+              '[.[][] | select(.tag_name == $tag)] | .[0] // empty' "$RUNNER_TEMP/ci-releases.json")
+            display_status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/display-tag.json" --write-out '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}")
+            case "$display_status" in
+              200)
+                if [[ -z "$existing" ]]; then
+                  echo "CI tag $release_tag exists without a release." >&2; exit 1
+                fi
+                display_type=$(jq -r '.object.type' "$RUNNER_TEMP/display-tag.json")
+                display_sha=$(jq -r '.object.sha' "$RUNNER_TEMP/display-tag.json")
+                while [[ "$display_type" == tag && "$display_sha" =~ ^[0-9a-f]{40}$ ]]; do
+                  display_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${display_sha}")
+                  display_type=$(jq -r '.object.type' <<< "$display_object")
+                  display_sha=$(jq -r '.object.sha' <<< "$display_object")
+                done
+                if [[ "$display_type" != commit || ! "$display_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "CI tag $release_tag does not point to a commit." >&2; exit 1
+                fi
+                verify_main_ancestor "$release_tag" "$display_sha"
+                ;;
+              404)
+                if [[ -n "$existing" ]] && ! jq -e '.draft == true and .target_commitish == "main"' <<< "$existing" >/dev/null; then
+                  echo "Release $release_tag has no matching CI tag or draft target." >&2; exit 1
+                fi
+                ;;
+              *) echo "Cannot inspect CI tag $release_tag (HTTP $display_status)." >&2; exit 1 ;;
+            esac
+
+            if [[ -n "$existing" ]]; then
+              refs=$(jq -r '.body // ""' <<< "$existing" | sed -n '1s/^<!-- rive-ci-refs: \(.*\) -->$/\1/p')
+              if [[ -z "$refs" ]] || ! jq -e --arg tag "$upstream_tag" --arg sha "$plugin_sha" '
+                .channel == "tag" and .upstreamTag == $tag and .pluginSha == $sha and
+                .upstreamReleaseId == "" and .upstreamPublishedAt == "" and
+                (.runtimeSha | test("^[0-9a-f]{40}$")) and (.ciSha | test("^[0-9a-f]{40}$"))
+              ' <<< "$refs" >/dev/null || ! jq -e '.prerelease == true' <<< "$existing" >/dev/null; then
+                echo "Release $release_tag has conflicting pinned metadata or prerelease flag." >&2
+                exit 1
+              fi
+              ci_sha=$(jq -r '.ciSha' <<< "$refs")
+              gh api "repos/${GITHUB_REPOSITORY}/commits/${ci_sha}" --jq '.sha' | grep -Fxq "$ci_sha"
+              if jq -e '[.assets[] | select(.name == "RiveUnreal-Win64.zip" and .state == "uploaded" and (.size // 0) > 0)] | length > 0' \
+                <<< "$existing" >/dev/null; then
+                if [[ "$(jq -r '.draft' <<< "$existing")" == true ]]; then
+                  gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --target main --draft=false --prerelease --latest=false
+                fi
+                echo "Already built upstream tag $upstream_tag."
+                continue
+              fi
+              echo "Retrying incomplete release $release_tag with pinned commits."
+            fi
+            jq -nc --arg release_tag "$release_tag" --arg upstream_tag "$upstream_tag" \
+              --arg plugin_sha "$plugin_sha" --arg ci_sha "$ci_sha" \
+              '{release_tag:$release_tag, upstream_tag:$upstream_tag, plugin_sha:$plugin_sha, ci_sha:$ci_sha}' \
+              >> "$RUNNER_TEMP/tag-matrix.jsonl"
+          done < "$RUNNER_TEMP/candidate-tags.txt"
+          matrix=$(jq -sc '.' "$RUNNER_TEMP/tag-matrix.jsonl")
+          count=$(jq 'length' <<< "$matrix")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Pending upstream tags: $count"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-win64.yml
+    with:
+      channel: tag
+      release_tag: ${{ matrix.release_tag }}
+      version_name: ${{ matrix.upstream_tag }}
+      plugin_sha: ${{ matrix.plugin_sha }}
+      ci_sha: ${{ matrix.ci_sha }}
+      upstream_tag: ${{ matrix.upstream_tag }}

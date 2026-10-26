@@ -1,6 +1,12 @@
 name: Release stable Rive Unreal Win64 plugin
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-win64.yml'
+      - '.github/workflows/build-win64.yml'
+      - 'Scripts/package_ci_release.py'
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
