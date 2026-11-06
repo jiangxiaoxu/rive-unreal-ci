@@ -110,6 +110,26 @@ jobs:
             ci_sha=$GITHUB_SHA
             existing=$(jq -c --arg tag "$release_tag" \
               '[.[][] | select(.tag_name == $tag)] | .[0] // empty' "$RUNNER_TEMP/ci-releases.json")
+            if [[ -z "$existing" && -z "$REQUESTED_TAG" && "$upstream_tag" =~ -weekly_[0-9]{4}_[0-9]{2}_[0-9]{2}$ ]]; then
+              marker_tag="built-weekly-$upstream_tag"
+              marker_status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/weekly-marker.json" --write-out '%{http_code}' \
+                -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${marker_tag}")
+              case "$marker_status" in
+                200)
+                  marker_type=$(jq -r '.object.type' "$RUNNER_TEMP/weekly-marker.json")
+                  marker_sha=$(jq -r '.object.sha' "$RUNNER_TEMP/weekly-marker.json")
+                  if [[ "$marker_type" != commit || ! "$marker_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                    echo "Invalid weekly completion marker $marker_tag." >&2; exit 1
+                  fi
+                  verify_main_ancestor "$marker_tag" "$marker_sha"
+                  echo "Already built and pruned upstream weekly $upstream_tag."
+                  continue
+                  ;;
+                404) ;;
+                *) echo "Cannot inspect weekly completion marker (HTTP $marker_status)." >&2; exit 1 ;;
+              esac
+            fi
             display_status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/display-tag.json" --write-out '%{http_code}' \
               -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}")
@@ -189,3 +209,69 @@ jobs:
       plugin_sha: ${{ matrix.plugin_sha }}
       ci_sha: ${{ matrix.ci_sha }}
       upstream_tag: ${{ matrix.upstream_tag }}
+
+  prune-weekly:
+    needs: [discover, build]
+    if: >-
+      ${{ always() && needs.discover.result == 'success' &&
+          (needs.discover.outputs.count == '0' || needs.build.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Keep the newest upstream weekly package
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/weekly-releases.json"
+          jq -r '
+            [.[][]
+             | select(.draft == false and .prerelease == true)
+             | . as $release
+             | try (
+                 (($release.body // "") | split("\n")[0]
+                  | capture("^<!-- rive-ci-refs: (?<json>.*) -->$").json | fromjson) as $refs
+                 | select($refs.channel == "tag" and
+                     ("tag-" + $refs.upstreamTag) == $release.tag_name and
+                     ($refs.upstreamTag | test("^[A-Za-z0-9][A-Za-z0-9._-]*-weekly_[0-9]{4}_[0-9]{2}_[0-9]{2}$")))
+                 | select([$release.assets[] | select(.name == "RiveUnreal-Win64.zip" and .state == "uploaded" and (.size // 0) > 0)] | length > 0)
+                 | {tag: $release.tag_name, upstream: $refs.upstreamTag,
+                    date: ($refs.upstreamTag | capture("-weekly_(?<date>[0-9]{4}_[0-9]{2}_[0-9]{2})$").date),
+                    id: $release.id}
+               ) catch empty]
+            | sort_by(.date, .upstream, .id) | reverse | .[1:]
+            | .[] | [.tag, .upstream] | @tsv
+          ' "$RUNNER_TEMP/weekly-releases.json" > "$RUNNER_TEMP/prune-weekly-tags.txt"
+          main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')
+          if [[ ! "$main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Cannot resolve CI repository main commit.' >&2; exit 1
+          fi
+          while IFS=$'\t' read -r tag upstream_tag; do
+            marker_tag="built-weekly-$upstream_tag"
+            marker_status=$(curl --silent --show-error --location --output "$RUNNER_TEMP/prune-marker.json" --write-out '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/tags/${marker_tag}")
+            case "$marker_status" in
+              200)
+                marker_type=$(jq -r '.object.type' "$RUNNER_TEMP/prune-marker.json")
+                marker_sha=$(jq -r '.object.sha' "$RUNNER_TEMP/prune-marker.json")
+                if [[ "$marker_type" != commit || ! "$marker_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "Invalid weekly completion marker $marker_tag." >&2; exit 1
+                fi
+                comparison=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${marker_sha}...${main_sha}" --jq '.status')
+                if [[ "$comparison" != ahead && "$comparison" != identical ]]; then
+                  echo "Completion marker $marker_tag is outside main history." >&2; exit 1
+                fi
+                ;;
+              404)
+                gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" -f "ref=refs/tags/${marker_tag}" -f "sha=${main_sha}" >/dev/null
+                ;;
+              *) echo "Cannot inspect weekly completion marker (HTTP $marker_status)." >&2; exit 1 ;;
+            esac
+          done < "$RUNNER_TEMP/prune-weekly-tags.txt"
+          while IFS=$'\t' read -r tag upstream_tag; do
+            echo "Deleting old weekly release and display tag: $tag"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done < "$RUNNER_TEMP/prune-weekly-tags.txt"
